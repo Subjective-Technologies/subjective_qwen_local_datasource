@@ -1,4 +1,5 @@
 {
+  "description": "Model profile for local Qwen runtimes, exposed as a selectable local LLM option through compatible connectors.",
   "domainCategory": "AI & Automation",
   "subjectiveTechnologyElement": "DataSources",
   "publisher": "BrainBoost Ltd.",
@@ -9,7 +10,7 @@
     {
       "type": "splitList",
       "title": "Qwen Local",
-      "text": "A Subjective data source for Qwen Local. This data source is currently a skeleton (fetch returns no items).",
+      "text": "Model profile for local Qwen runtimes, exposed as a selectable local LLM option through compatible connectors.",
       "image": {
         "src": "/subjective_qwen_local_datasource/icon.svg",
         "alt": "Qwen Local icon"
