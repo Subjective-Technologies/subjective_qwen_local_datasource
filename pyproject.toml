@@ -1,0 +1,23 @@
+﻿[project]
+name = "subjective_qwen_local_datasource"
+version = "0.1.0"
+description = "Subjective data source plugin: Qwen Local."
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "subjective-abstract-data-source-package @ git+https://github.com/PabloBorda/subjective-abstract-data-source-package.git",
+  "brainboost-data-source-logger-package @ git+https://github.com/PabloBorda/brainboost_data_source_logger_package.git",
+  "brainboost-configuration-package @ git+https://github.com/PabloBorda/brainboost_configuration_package.git",
+  "brainboost-rclone-oauth-package @ git+https://github.com/Subjective-Technologies/brainboost_rclone_oauth_package.git",
+  "transformers>=4.45.0",
+  "torch>=2.0.0",
+  "torchvision>=0.15.0",
+  "accelerate>=0.26.0",
+  "qwen-vl-utils>=0.0.8",
+  "pillow>=10.0.0",
+  "bitsandbytes>=0.41.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
