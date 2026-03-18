@@ -66,25 +66,15 @@ class TestQwenLocalDataSourceInit:
         assert ds.params.get("top_p") == 0.9
 
 
-class TestQwenLocalDataSourceConnectionData:
-    """Tests for connection data configuration."""
-
-    def test_connection_type(self):
-        """Test that connection type is ON_DEMAND."""
-        ds = SubjectiveQwenLocalDataSource(name="test")
-        connection_data = ds.get_connection_data()
-
-        assert connection_data.get("connection_type") == "ON_DEMAND"
+class TestQwenLocalDataSourceConnectionSchema:
+    """Tests for v2 connection schema configuration."""
 
     def test_connection_fields_exist(self):
         """Test that all expected fields are present."""
-        ds = SubjectiveQwenLocalDataSource(name="test")
-        connection_data = ds.get_connection_data()
-        fields = connection_data.get("fields", [])
+        schema = SubjectiveQwenLocalDataSource.connection_schema()
+        field_names = list(schema.keys())
 
-        field_names = [f["name"] for f in fields]
-
-        assert "connection_name" in field_names
+        assert "connection_name" not in field_names
         assert "model_id" in field_names
         assert "device" in field_names
         assert "max_new_tokens" in field_names
@@ -93,34 +83,28 @@ class TestQwenLocalDataSourceConnectionData:
         assert "system_prompt" in field_names
         assert "load_in_4bit" in field_names
         assert "load_in_8bit" in field_names
+        assert "torch_dtype" in field_names
+        assert "trust_remote_code" in field_names
 
     def test_connection_fields_count(self):
         """Test the number of configuration fields."""
-        ds = SubjectiveQwenLocalDataSource(name="test")
-        connection_data = ds.get_connection_data()
-        fields = connection_data.get("fields", [])
-
-        assert len(fields) == 12
+        schema = SubjectiveQwenLocalDataSource.connection_schema()
+        assert len(schema) == 11
 
     def test_required_fields(self):
         """Test that required fields are marked correctly."""
-        ds = SubjectiveQwenLocalDataSource(name="test")
-        connection_data = ds.get_connection_data()
-        fields = connection_data.get("fields", [])
+        schema = SubjectiveQwenLocalDataSource.connection_schema()
+        required_fields = [name for name, field in schema.items() if field.get("required")]
 
-        required_fields = [f["name"] for f in fields if f.get("required")]
-
-        assert "connection_name" in required_fields
-        assert "model_id" in required_fields
+        assert required_fields == ["model_id"]
 
 
 class TestQwenLocalDataSourceIcon:
     """Tests for icon functionality."""
 
     def test_icon_returns_svg(self):
-        """Test that get_icon returns valid SVG."""
-        ds = SubjectiveQwenLocalDataSource(name="test")
-        icon = ds.get_icon()
+        """Test that icon returns valid SVG."""
+        icon = SubjectiveQwenLocalDataSource.icon()
 
         assert icon is not None
         assert len(icon) > 0
@@ -128,8 +112,7 @@ class TestQwenLocalDataSourceIcon:
 
     def test_icon_is_valid_xml(self):
         """Test that the icon is valid XML."""
-        ds = SubjectiveQwenLocalDataSource(name="test")
-        icon = ds.get_icon()
+        icon = SubjectiveQwenLocalDataSource.icon()
 
         # Basic XML validation
         assert icon.strip().startswith("<svg") or icon.strip().startswith("<?xml")
@@ -255,7 +238,7 @@ class TestQwenLocalDataSourceModel:
     @pytest.mark.slow
     def test_text_message_processing(self, datasource):
         """Test processing a simple text message."""
-        response = datasource._process_message("What is 2+2?")
+        response = datasource._handle_request("What is 2+2?")
 
         if response.get("success"):
             assert "response" in response

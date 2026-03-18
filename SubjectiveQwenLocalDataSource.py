@@ -8,14 +8,14 @@ Supports both text and image inputs using the Qwen2-VL family of models.
 import os
 import base64
 import mimetypes
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 from io import BytesIO
 
-from subjective_abstract_data_source_package import SubjectiveOnDemandDataSource
+from subjective_abstract_data_source_package import SubjectiveDataSource
 from brainboost_data_source_logger_package.BBLogger import BBLogger
 
 
-class SubjectiveQwenLocalDataSource(SubjectiveOnDemandDataSource):
+class SubjectiveQwenLocalDataSource(SubjectiveDataSource):
     """
     On-demand data source for running Qwen2-VL models locally.
 
@@ -32,46 +32,200 @@ class SubjectiveQwenLocalDataSource(SubjectiveOnDemandDataSource):
     _processor = None
     _model_loaded = False
 
-    def __init__(self, name: str = "qwen_local", params: Dict = None):
+    def __init__(self, **kwargs):
         """
         Initialize the Qwen Local VLM data source.
 
-        Args:
-            name: Identifier for this data source instance
-            params: Configuration dictionary with the following options:
-                - connection_name: Friendly name for the connection
-                - model_id: HuggingFace model ID (default: Qwen/Qwen2-VL-2B-Instruct)
-                - device: Device to run on (auto, cuda, cpu)
-                - max_new_tokens: Maximum tokens to generate (default: 1024)
-                - temperature: Sampling temperature (default: 0.7)
-                - top_p: Top-p sampling parameter (default: 0.9)
-                - do_sample: Whether to use sampling (default: True)
-                - system_prompt: Optional system prompt
-                - load_in_4bit: Use 4-bit quantization (default: False)
-                - load_in_8bit: Use 8-bit quantization (default: False)
-                - torch_dtype: Data type (auto, float16, bfloat16, float32)
-                - trust_remote_code: Trust remote code from HF (default: True)
+        Supports both v1-style `params=` initialization and v2-style
+        `connection=` initialization via the shared base class.
         """
-        super().__init__(name, params)
+        super().__init__(**kwargs)
         self._normalize_params()
         self._check_dependencies()
 
+    @classmethod
+    def connection_schema(cls):
+        return {
+            "model_id": {
+                "type": "select",
+                "label": "Model",
+                "required": True,
+                "default": "Qwen/Qwen2-VL-2B-Instruct",
+                "options": [
+                    {"value": "Qwen/Qwen2-VL-2B-Instruct", "label": "Qwen2-VL 2B Instruct (Recommended for most users)"},
+                    {"value": "Qwen/Qwen2-VL-7B-Instruct", "label": "Qwen2-VL 7B Instruct (Better quality, needs more VRAM)"},
+                    {"value": "Qwen/Qwen2-VL-72B-Instruct", "label": "Qwen2-VL 72B Instruct (Best quality, needs A100/H100)"},
+                    {"value": "Qwen/Qwen2.5-VL-3B-Instruct", "label": "Qwen2.5-VL 3B Instruct"},
+                    {"value": "Qwen/Qwen2.5-VL-7B-Instruct", "label": "Qwen2.5-VL 7B Instruct"},
+                    {"value": "Qwen/Qwen2.5-VL-32B-Instruct", "label": "Qwen2.5-VL 32B Instruct"},
+                    {"value": "Qwen/Qwen2.5-VL-72B-Instruct", "label": "Qwen2.5-VL 72B Instruct"},
+                ],
+                "description": "Qwen vision-language model to load locally.",
+            },
+            "device": {
+                "type": "select",
+                "label": "Device",
+                "required": False,
+                "default": "auto",
+                "options": [
+                    {"value": "auto", "label": "Auto (Recommended)"},
+                    {"value": "cuda", "label": "CUDA (GPU)"},
+                    {"value": "cpu", "label": "CPU (Slow)"},
+                ],
+                "description": "Device to run the model on.",
+            },
+            "max_new_tokens": {
+                "type": "number",
+                "label": "Max New Tokens",
+                "required": False,
+                "default": 1024,
+                "description": "Maximum number of tokens to generate.",
+            },
+            "temperature": {
+                "type": "number",
+                "label": "Temperature",
+                "required": False,
+                "default": 0.7,
+                "description": "Sampling temperature.",
+            },
+            "top_p": {
+                "type": "number",
+                "label": "Top P",
+                "required": False,
+                "default": 0.9,
+                "description": "Top-p sampling parameter.",
+            },
+            "do_sample": {
+                "type": "checkbox",
+                "label": "Use Sampling",
+                "required": False,
+                "default": True,
+                "description": "Enable temperature/top_p sampling.",
+            },
+            "system_prompt": {
+                "type": "textarea",
+                "label": "System Prompt",
+                "required": False,
+                "default": "",
+                "description": "Optional system instructions for the model.",
+            },
+            "load_in_4bit": {
+                "type": "checkbox",
+                "label": "4-bit Quantization",
+                "required": False,
+                "default": False,
+                "description": "Load the model in 4-bit precision.",
+            },
+            "load_in_8bit": {
+                "type": "checkbox",
+                "label": "8-bit Quantization",
+                "required": False,
+                "default": False,
+                "description": "Load the model in 8-bit precision.",
+            },
+            "torch_dtype": {
+                "type": "select",
+                "label": "Torch Data Type",
+                "required": False,
+                "default": "auto",
+                "options": [
+                    {"value": "auto", "label": "Auto"},
+                    {"value": "float16", "label": "Float16 (Recommended for GPU)"},
+                    {"value": "bfloat16", "label": "BFloat16 (For newer GPUs)"},
+                    {"value": "float32", "label": "Float32 (CPU or max precision)"},
+                ],
+                "description": "Data type for model weights.",
+            },
+            "trust_remote_code": {
+                "type": "checkbox",
+                "label": "Trust Remote Code",
+                "required": False,
+                "default": True,
+                "description": "Allow execution of model-specific code from HuggingFace.",
+            },
+        }
+
+    @classmethod
+    def request_schema(cls):
+        return {
+            "message": {
+                "type": "text",
+                "label": "Message",
+                "required": False,
+                "description": "Prompt to send to the local Qwen model.",
+            },
+        }
+
+    @classmethod
+    def output_schema(cls):
+        return {
+            "success": {"type": "bool", "label": "Success"},
+            "response": {"type": "textarea", "label": "Response"},
+            "model": {"type": "text", "label": "Model"},
+            "images_processed": {"type": "int", "label": "Images Processed"},
+            "original_message": {"type": "textarea", "label": "Original Message"},
+            "error": {"type": "bool", "label": "Error"},
+            "error_type": {"type": "text", "label": "Error Type"},
+            "message": {"type": "textarea", "label": "Message"},
+        }
+
+    @classmethod
+    def icon(cls) -> str:
+        """Return the SVG icon for this data source."""
+        icon_path = os.path.join(os.path.dirname(__file__), "icon.svg")
+        try:
+            with open(icon_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            BBLogger.log(f"Error reading icon file: {e}")
+            return '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+                <rect width="100" height="100" rx="20" fill="#6366f1"/>
+                <text x="50" y="65" font-family="Arial, sans-serif" font-size="40"
+                      font-weight="bold" fill="white" text-anchor="middle">Q</text>
+            </svg>'''
+
+    def supports_chat(self) -> bool:
+        return True
+
+    def handle_message(self, message, files=None):
+        if files:
+            if isinstance(message, dict):
+                payload = dict(message)
+                payload["files"] = files
+            else:
+                payload = {
+                    "content": "" if message is None else str(message),
+                    "files": files,
+                }
+            return self._handle_request(payload)
+        return self._handle_request(message)
+
+    def run(self, request):
+        if isinstance(request, dict):
+            return self.handle_message(request, files=request.get("files"))
+        return self.handle_message(request)
+
     def _normalize_params(self):
         """Normalize and validate parameters with safe defaults."""
-        if not self.params:
+        conn = getattr(self, "_connection", {}) or {}
+        if not isinstance(self.params, dict):
             self.params = {}
 
         # Model selection - default to smaller 2B model for accessibility
-        if not self.params.get("model_id"):
+        if not conn.get("model_id") and not self.params.get("model_id"):
             self.params["model_id"] = "Qwen/Qwen2-VL-2B-Instruct"
+        elif conn.get("model_id"):
+            self.params["model_id"] = conn["model_id"]
 
         # Device selection
-        if not self.params.get("device"):
+        if not conn.get("device") and not self.params.get("device"):
             self.params["device"] = "auto"
+        elif conn.get("device"):
+            self.params["device"] = conn["device"]
 
-        # Generation parameters
+        # Generation parameters - conn value takes priority
         try:
-            max_tokens = int(self.params.get("max_new_tokens", 1024))
+            max_tokens = int(conn.get("max_new_tokens") or self.params.get("max_new_tokens", 1024))
             if max_tokens <= 0:
                 max_tokens = 1024
         except (ValueError, TypeError):
@@ -79,7 +233,7 @@ class SubjectiveQwenLocalDataSource(SubjectiveOnDemandDataSource):
         self.params["max_new_tokens"] = max_tokens
 
         try:
-            temperature = float(self.params.get("temperature", 0.7))
+            temperature = float(conn.get("temperature") or self.params.get("temperature", 0.7))
             if temperature < 0.0 or temperature > 2.0:
                 temperature = 0.7
         except (ValueError, TypeError):
@@ -87,22 +241,28 @@ class SubjectiveQwenLocalDataSource(SubjectiveOnDemandDataSource):
         self.params["temperature"] = temperature
 
         try:
-            top_p = float(self.params.get("top_p", 0.9))
+            top_p = float(conn.get("top_p") or self.params.get("top_p", 0.9))
             if top_p < 0.0 or top_p > 1.0:
                 top_p = 0.9
         except (ValueError, TypeError):
             top_p = 0.9
         self.params["top_p"] = top_p
 
-        # Boolean parameters
-        self.params["do_sample"] = self.params.get("do_sample", True)
-        self.params["load_in_4bit"] = self.params.get("load_in_4bit", False)
-        self.params["load_in_8bit"] = self.params.get("load_in_8bit", False)
-        self.params["trust_remote_code"] = self.params.get("trust_remote_code", True)
+        # Boolean parameters - conn takes priority
+        self.params["do_sample"] = conn.get("do_sample") if "do_sample" in conn else self.params.get("do_sample", True)
+        self.params["load_in_4bit"] = conn.get("load_in_4bit") if "load_in_4bit" in conn else self.params.get("load_in_4bit", False)
+        self.params["load_in_8bit"] = conn.get("load_in_8bit") if "load_in_8bit" in conn else self.params.get("load_in_8bit", False)
+        self.params["trust_remote_code"] = conn.get("trust_remote_code") if "trust_remote_code" in conn else self.params.get("trust_remote_code", True)
 
         # Torch dtype
-        if not self.params.get("torch_dtype"):
+        if not conn.get("torch_dtype") and not self.params.get("torch_dtype"):
             self.params["torch_dtype"] = "auto"
+        elif conn.get("torch_dtype"):
+            self.params["torch_dtype"] = conn["torch_dtype"]
+
+        # System prompt
+        if "system_prompt" in conn:
+            self.params["system_prompt"] = conn["system_prompt"]
 
     def _check_dependencies(self):
         """Check if required dependencies are available."""
@@ -217,7 +377,7 @@ class SubjectiveQwenLocalDataSource(SubjectiveOnDemandDataSource):
             BBLogger.log(f"Error loading Qwen2-VL model: {e}")
             return False
 
-    def _process_message(self, message: Any) -> Dict:
+    def _handle_request(self, message: Any) -> Dict:
         """
         Process a text-only or mixed message.
 
@@ -547,154 +707,3 @@ class SubjectiveQwenLocalDataSource(SubjectiveOnDemandDataSource):
         except Exception as e:
             BBLogger.log(f"Error clearing CUDA cache: {e}")
 
-    def get_icon(self) -> str:
-        """Return the SVG icon for this data source."""
-        icon_path = os.path.join(os.path.dirname(__file__), "icon.svg")
-        try:
-            with open(icon_path, "r", encoding="utf-8") as f:
-                return f.read()
-        except Exception as e:
-            BBLogger.log(f"Error reading icon file: {e}")
-            # Fallback Qwen-style icon
-            return '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-                <rect width="100" height="100" rx="20" fill="#6366f1"/>
-                <text x="50" y="65" font-family="Arial, sans-serif" font-size="40"
-                      font-weight="bold" fill="white" text-anchor="middle">Q</text>
-            </svg>'''
-
-    def get_connection_data(self) -> dict:
-        """
-        Return connection configuration metadata for UI/configuration.
-
-        Returns:
-            Dictionary with connection type and configurable fields
-        """
-        return {
-            "connection_type": "ON_DEMAND",
-            "fields": [
-                {
-                    "name": "connection_name",
-                    "label": "Connection Name",
-                    "type": "text",
-                    "required": True,
-                    "default": "Qwen Local VLM",
-                    "description": "Friendly name for this connection"
-                },
-                {
-                    "name": "model_id",
-                    "label": "Model",
-                    "type": "select",
-                    "required": True,
-                    "default": "Qwen/Qwen2-VL-2B-Instruct",
-                    "options": [
-                        {"value": "Qwen/Qwen2-VL-2B-Instruct", "label": "Qwen2-VL 2B Instruct (Recommended for most users)"},
-                        {"value": "Qwen/Qwen2-VL-7B-Instruct", "label": "Qwen2-VL 7B Instruct (Better quality, needs more VRAM)"},
-                        {"value": "Qwen/Qwen2-VL-72B-Instruct", "label": "Qwen2-VL 72B Instruct (Best quality, needs A100/H100)"},
-                        {"value": "Qwen/Qwen2.5-VL-3B-Instruct", "label": "Qwen2.5-VL 3B Instruct"},
-                        {"value": "Qwen/Qwen2.5-VL-7B-Instruct", "label": "Qwen2.5-VL 7B Instruct"},
-                        {"value": "Qwen/Qwen2.5-VL-32B-Instruct", "label": "Qwen2.5-VL 32B Instruct"},
-                        {"value": "Qwen/Qwen2.5-VL-72B-Instruct", "label": "Qwen2.5-VL 72B Instruct"}
-                    ],
-                    "description": "Qwen2-VL model to use. Larger models need more GPU memory."
-                },
-                {
-                    "name": "device",
-                    "label": "Device",
-                    "type": "select",
-                    "required": False,
-                    "default": "auto",
-                    "options": [
-                        {"value": "auto", "label": "Auto (Recommended)"},
-                        {"value": "cuda", "label": "CUDA (GPU)"},
-                        {"value": "cpu", "label": "CPU (Slow)"}
-                    ],
-                    "description": "Device to run the model on. Auto will use GPU if available."
-                },
-                {
-                    "name": "max_new_tokens",
-                    "label": "Max New Tokens",
-                    "type": "number",
-                    "required": False,
-                    "default": 1024,
-                    "min": 1,
-                    "max": 8192,
-                    "description": "Maximum number of tokens to generate in the response"
-                },
-                {
-                    "name": "temperature",
-                    "label": "Temperature",
-                    "type": "number",
-                    "required": False,
-                    "default": 0.7,
-                    "min": 0.0,
-                    "max": 2.0,
-                    "step": 0.1,
-                    "description": "Controls randomness. Lower = more deterministic, higher = more creative."
-                },
-                {
-                    "name": "top_p",
-                    "label": "Top P",
-                    "type": "number",
-                    "required": False,
-                    "default": 0.9,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.05,
-                    "description": "Nucleus sampling parameter. Lower values = more focused responses."
-                },
-                {
-                    "name": "do_sample",
-                    "label": "Use Sampling",
-                    "type": "checkbox",
-                    "required": False,
-                    "default": True,
-                    "description": "Enable temperature/top_p sampling. Disable for greedy decoding."
-                },
-                {
-                    "name": "system_prompt",
-                    "label": "System Prompt",
-                    "type": "textarea",
-                    "required": False,
-                    "default": "",
-                    "description": "Optional system instructions for the model"
-                },
-                {
-                    "name": "load_in_4bit",
-                    "label": "4-bit Quantization",
-                    "type": "checkbox",
-                    "required": False,
-                    "default": False,
-                    "description": "Load model in 4-bit precision (saves VRAM, requires bitsandbytes)"
-                },
-                {
-                    "name": "load_in_8bit",
-                    "label": "8-bit Quantization",
-                    "type": "checkbox",
-                    "required": False,
-                    "default": False,
-                    "description": "Load model in 8-bit precision (saves VRAM, requires bitsandbytes)"
-                },
-                {
-                    "name": "torch_dtype",
-                    "label": "Torch Data Type",
-                    "type": "select",
-                    "required": False,
-                    "default": "auto",
-                    "options": [
-                        {"value": "auto", "label": "Auto"},
-                        {"value": "float16", "label": "Float16 (Recommended for GPU)"},
-                        {"value": "bfloat16", "label": "BFloat16 (For newer GPUs)"},
-                        {"value": "float32", "label": "Float32 (CPU or max precision)"}
-                    ],
-                    "description": "Data type for model weights. Float16 is recommended for GPUs."
-                },
-                {
-                    "name": "trust_remote_code",
-                    "label": "Trust Remote Code",
-                    "type": "checkbox",
-                    "required": False,
-                    "default": True,
-                    "description": "Allow execution of model-specific code from HuggingFace"
-                }
-            ]
-        }
