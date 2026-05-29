@@ -7,7 +7,10 @@ Supports both text and image inputs using the Qwen2-VL family of models.
 
 import os
 import base64
+import hashlib
+import json
 import mimetypes
+import re
 from typing import Any, Dict, List, Optional
 from io import BytesIO
 
@@ -163,6 +166,8 @@ class SubjectiveQwenLocalDataSource(SubjectiveDataSource):
             "response": {"type": "textarea", "label": "Response"},
             "model": {"type": "text", "label": "Model"},
             "images_processed": {"type": "int", "label": "Images Processed"},
+            "image_paths_processed": {"type": "json", "label": "Image Paths Processed"},
+            "image_sha256s": {"type": "json", "label": "Image SHA256 Hashes"},
             "original_message": {"type": "textarea", "label": "Original Message"},
             "error": {"type": "bool", "label": "Error"},
             "error_type": {"type": "text", "label": "Error Type"},
@@ -202,8 +207,87 @@ class SubjectiveQwenLocalDataSource(SubjectiveDataSource):
 
     def run(self, request):
         if isinstance(request, dict):
+            # Pipelines commonly wire a screenshot/image producer as `image_path`
+            # (single str) or `image_paths` (list[str]). The vision code path
+            # only consumes `files`, so bridge here so existing pipes that use
+            # `image_path` actually get vision inference instead of silently
+            # falling through to text-only.
+            request = self._bridge_image_paths(request)
+            # When the producer skipped this tick (dedupe), `image_path` is
+            # the empty string. Short-circuit so we don't waste a Qwen call
+            # producing deterministic template text on no image.
+            if self._request_signals_skipped_image(request):
+                return self._skipped_image_response(request)
             return self.handle_message(request, files=request.get("files"))
         return self.handle_message(request)
+
+    def _bridge_image_paths(self, request: Dict) -> Dict:
+        if request.get("files"):
+            return request
+        raw = request.get("image_paths")
+        if raw is None:
+            raw = request.get("image_path")
+        if isinstance(raw, str):
+            paths = [raw] if raw else []
+        elif isinstance(raw, list):
+            paths = [p for p in raw if isinstance(p, str) and p]
+        else:
+            paths = []
+        files = []
+        for p in paths:
+            try:
+                if not os.path.isfile(p):
+                    continue
+                with open(p, "rb") as fh:
+                    raw = fh.read()
+                files.append({
+                    "name": os.path.basename(p),
+                    "mime_type": self._guess_mime_type(p),
+                    "data_base64": base64.b64encode(raw).decode("ascii"),
+                    "source_path": os.path.abspath(p),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                })
+            except Exception as exc:
+                BBLogger.log(f"image_path bridge failed for {p}: {exc}")
+        if files:
+            request = dict(request)
+            request["files"] = files
+        return request
+
+    @staticmethod
+    def _request_signals_skipped_image(request: Dict) -> bool:
+        if request.get("files"):
+            return False
+        if "image_path" in request and not request.get("image_path"):
+            return True
+        if "image_paths" in request:
+            raw = request.get("image_paths")
+            if not raw:
+                return True
+            if isinstance(raw, list) and not any(isinstance(p, str) and p for p in raw):
+                return True
+        return False
+
+    @staticmethod
+    def _skipped_image_response(request: Dict) -> Dict:
+        # Emit a syntactically-valid WorkAtom that downstream
+        # `isPlaceholderEpisode` recognises as low-signal (empty primary_task
+        # and dense_summary) so it doesn't poison the episode accumulator.
+        payload = (
+            '{"work_atom_id":"atom_skipped","timestamp":"","source_type":"screenshot",'
+            '"work_relevance":"low_signal","rankable":false,"primary_task":"",'
+            '"subtask":"","workflow_stage":"","user_intent":"","applications":[],'
+            '"business_objects":[],"domain_knowledge":[],"procedural_skills":[],'
+            '"dense_summary":"","uncertainty":{"low_signal":true,"mixed_content":false,'
+            '"non_work_signals":[]},"skipped":true}'
+        )
+        return {
+            "success": True,
+            "response": payload,
+            "model": "skipped",
+            "original_message": request.get("message") or request.get("content") or "",
+            "skipped": True,
+        }
 
     def _normalize_params(self):
         """Normalize and validate parameters with safe defaults."""
@@ -490,6 +574,7 @@ class SubjectiveQwenLocalDataSource(SubjectiveDataSource):
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False
             )[0]
+            response_text = self._coerce_workatom_response(text, response_text)
 
             BBLogger.log(f"Qwen2-VL response generated (length: {len(response_text)} chars)")
 
@@ -647,6 +732,7 @@ class SubjectiveQwenLocalDataSource(SubjectiveDataSource):
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False
             )[0]
+            response_text = self._coerce_workatom_response(text, response_text)
 
             BBLogger.log(f"Qwen2-VL vision response generated (length: {len(response_text)} chars)")
 
@@ -655,6 +741,14 @@ class SubjectiveQwenLocalDataSource(SubjectiveDataSource):
                 "response": response_text,
                 "model": self.params.get("model_id"),
                 "images_processed": len(images),
+                "image_paths_processed": [
+                    f.get("source_path") for f in files
+                    if isinstance(f, dict) and f.get("source_path")
+                ],
+                "image_sha256s": [
+                    f.get("sha256") for f in files
+                    if isinstance(f, dict) and f.get("sha256")
+                ],
                 "original_message": text
             }
 
@@ -683,6 +777,134 @@ class SubjectiveQwenLocalDataSource(SubjectiveDataSource):
             return text[:max_chars] + "\n[truncated]"
         return text
 
+    @classmethod
+    def _coerce_workatom_response(cls, prompt: str, response: str) -> str:
+        if '"work_atom_id"' not in str(prompt or ""):
+            return response
+        extracted = cls._extract_json_object(response)
+        if extracted:
+            return cls._normalize_workatom_payload(extracted)
+
+        summary = str(response or "").strip()
+        non_work = cls._looks_non_work(summary)
+        payload = {
+            "work_atom_id": "atom_001",
+            "timestamp": "",
+            "source_type": "screenshot",
+            "work_relevance": "non_work" if non_work else "possibly_work_related",
+            "rankable": False if non_work else True,
+            "primary_task": summary,
+            "subtask": "",
+            "workflow_stage": "",
+            "user_intent": "",
+            "applications": [],
+            "business_objects": [],
+            "domain_knowledge": [],
+            "procedural_skills": [],
+            "dense_summary": summary,
+            "uncertainty": {
+                "low_signal": not bool(summary),
+                "mixed_content": False,
+                "non_work_signals": ["entertainment_media"] if non_work else [],
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    @classmethod
+    def _normalize_workatom_payload(cls, raw_json: str) -> str:
+        try:
+            payload = json.loads(raw_json)
+        except Exception:
+            return raw_json
+        if not isinstance(payload, dict):
+            return raw_json
+        signal_text = " ".join(
+            str(payload.get(key) or "")
+            for key in ("primary_task", "dense_summary", "user_intent", "subtask")
+        )
+        apps = payload.get("applications")
+        if isinstance(apps, list):
+            signal_text += " " + " ".join(str(item) for item in apps)
+        if cls._looks_non_work(signal_text):
+            payload["work_relevance"] = "non_work"
+            payload["rankable"] = False
+            uncertainty = payload.get("uncertainty")
+            if not isinstance(uncertainty, dict):
+                uncertainty = {}
+            signals = uncertainty.get("non_work_signals")
+            if not isinstance(signals, list):
+                signals = []
+            if "entertainment_media" not in signals:
+                signals.append("entertainment_media")
+            uncertainty["non_work_signals"] = signals
+            uncertainty.setdefault("low_signal", False)
+            uncertainty.setdefault("mixed_content", False)
+            payload["uncertainty"] = uncertainty
+        return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _looks_non_work(text: str) -> bool:
+        lowered = str(text or "").lower()
+        return any(
+            needle in lowered
+            for needle in (
+                "youtube",
+                "video",
+                "music",
+                "movie",
+                "game",
+                "social media",
+                "entertainment",
+            )
+        )
+
+    @staticmethod
+    def _extract_json_object(text: str) -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, flags=re.IGNORECASE | re.DOTALL)
+        if fenced:
+            raw = fenced.group(1).strip()
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return json.dumps(parsed, ensure_ascii=False)
+        except Exception:
+            pass
+
+        start = raw.find("{")
+        if start < 0:
+            return ""
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(raw)):
+            char = raw[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = raw[start:index + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict):
+                            return json.dumps(parsed, ensure_ascii=False)
+                    except Exception:
+                        return ""
+        return ""
+
     def _guess_mime_type(self, filename: str) -> str:
         """Guess MIME type from filename."""
         mime_type, _ = mimetypes.guess_type(filename)
@@ -706,4 +928,3 @@ class SubjectiveQwenLocalDataSource(SubjectiveDataSource):
             BBLogger.log("Qwen2-VL model unloaded and memory cleared")
         except Exception as e:
             BBLogger.log(f"Error clearing CUDA cache: {e}")
-
