@@ -548,6 +548,7 @@ class SubjectiveQwenLocalDataSource(SubjectiveDataSource):
 
             generation_kwargs = {
                 "max_new_tokens": self.params.get("max_new_tokens", 1024),
+                "repetition_penalty": float(self.params.get("repetition_penalty", 1.15)),
             }
 
             if self.params.get("do_sample", True):
@@ -706,6 +707,7 @@ class SubjectiveQwenLocalDataSource(SubjectiveDataSource):
             # Generate response
             generation_kwargs = {
                 "max_new_tokens": self.params.get("max_new_tokens", 1024),
+                "repetition_penalty": float(self.params.get("repetition_penalty", 1.15)),
             }
 
             if self.params.get("do_sample", True):
@@ -818,6 +820,7 @@ class SubjectiveQwenLocalDataSource(SubjectiveDataSource):
             return raw_json
         if not isinstance(payload, dict):
             return raw_json
+        cls._repair_degenerate_workatom(payload)
         signal_text = " ".join(
             str(payload.get(key) or "")
             for key in ("primary_task", "dense_summary", "user_intent", "subtask")
@@ -841,6 +844,158 @@ class SubjectiveQwenLocalDataSource(SubjectiveDataSource):
             uncertainty.setdefault("mixed_content", False)
             payload["uncertainty"] = uncertainty
         return json.dumps(payload, ensure_ascii=False)
+
+    _ATOM_TEXT_FIELDS = (
+        "primary_task",
+        "subtask",
+        "workflow_stage",
+        "user_intent",
+        "dense_summary",
+    )
+    _ATOM_LIST_FIELDS = (
+        "applications",
+        "business_objects",
+        "domain_knowledge",
+        "procedural_skills",
+    )
+
+    @classmethod
+    def _repair_degenerate_workatom(cls, payload: dict) -> bool:
+        """Drop model loops and lift a JSON blob stuffed into a text field.
+
+        Small local models sometimes put a second JSON document inside
+        ``primary_task`` and then repeat one traceback line dozens of times.
+        The useful labels stay. The repeated dump does not.
+        """
+        degenerate = False
+        for key in cls._ATOM_TEXT_FIELDS:
+            embedded = cls._embedded_json_object(payload.get(key))
+            if not embedded:
+                continue
+            degenerate = True
+            for field in (*cls._ATOM_TEXT_FIELDS, *cls._ATOM_LIST_FIELDS, "work_relevance", "source_type", "timestamp"):
+                if field in embedded:
+                    payload[field] = embedded[field]
+            if cls._value_is_repetitive(embedded):
+                degenerate = True
+        payload.pop("output", None)
+        for key, value in list(payload.items()):
+            cleaned, changed = cls._collapse_repeated_value(value)
+            payload[key] = cleaned
+            if changed:
+                degenerate = True
+        for key in cls._ATOM_LIST_FIELDS:
+            value = payload.get(key)
+            if isinstance(value, str):
+                text = value.strip()
+                payload[key] = [text] if text else []
+            elif isinstance(value, list):
+                payload[key] = [str(item).strip() for item in value if str(item).strip()][:5]
+            elif value in (None, ""):
+                payload[key] = []
+        for key in cls._ATOM_TEXT_FIELDS:
+            value = payload.get(key)
+            if isinstance(value, str) and len(value) > 400:
+                payload[key] = value[:400].rstrip()
+                degenerate = True
+        if degenerate:
+            payload["rankable"] = False
+            uncertainty = payload.get("uncertainty")
+            if not isinstance(uncertainty, dict):
+                uncertainty = {"low_signal": True, "mixed_content": False, "non_work_signals": []}
+            uncertainty["low_signal"] = True
+            signals = uncertainty.get("non_work_signals")
+            if not isinstance(signals, list):
+                signals = []
+            if "repetitive_model_output" not in signals:
+                signals.append("repetitive_model_output")
+            uncertainty["non_work_signals"] = signals
+            uncertainty.setdefault("mixed_content", False)
+            payload["uncertainty"] = uncertainty
+        return degenerate
+
+    @staticmethod
+    def _embedded_json_object(value: Any) -> dict | None:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @classmethod
+    def _value_is_repetitive(cls, value: Any) -> bool:
+        if isinstance(value, str):
+            lines = [line.strip() for line in value.splitlines() if line.strip()]
+            return any(lines.count(line) >= 4 for line in set(lines))
+        if isinstance(value, list):
+            rendered = [
+                item if isinstance(item, str) else json.dumps(item, sort_keys=True, ensure_ascii=False)
+                for item in value
+                if isinstance(item, (str, int, float, bool, dict, list)) or item is None
+            ]
+            return any(rendered.count(item) >= 4 for item in set(rendered))
+        if isinstance(value, dict):
+            return any(cls._value_is_repetitive(item) for item in value.values())
+        return False
+
+    @classmethod
+    def _collapse_repeated_value(cls, value: Any) -> tuple[Any, bool]:
+        if isinstance(value, str):
+            lines = value.splitlines()
+            counts: dict[str, int] = {}
+            for line in lines:
+                key = line.strip()
+                if key:
+                    counts[key] = counts.get(key, 0) + 1
+            if not any(count >= 4 for count in counts.values()):
+                return value, False
+            seen: set[str] = set()
+            kept: list[str] = []
+            for line in lines:
+                key = line.strip()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                kept.append(line)
+                if len(kept) >= 6:
+                    break
+            return "\n".join(kept), True
+        if isinstance(value, list):
+            changed = False
+            kept = []
+            seen: set[str] = set()
+            for item in value:
+                cleaned, item_changed = cls._collapse_repeated_value(item)
+                changed = changed or item_changed
+                marker = cleaned if isinstance(cleaned, str) else json.dumps(cleaned, sort_keys=True, ensure_ascii=False)
+                if marker in seen:
+                    changed = True
+                    continue
+                seen.add(marker)
+                kept.append(cleaned)
+                if len(kept) >= 8:
+                    changed = changed or len(value) > 8
+                    break
+            if len(kept) != len(value):
+                changed = True
+            return kept, changed
+        if isinstance(value, dict):
+            changed = False
+            kept = {}
+            for key, item in value.items():
+                if key in {"output", "traceback"}:
+                    changed = True
+                    continue
+                cleaned, item_changed = cls._collapse_repeated_value(item)
+                changed = changed or item_changed
+                kept[key] = cleaned
+            return kept, changed
+        return value, False
 
     @staticmethod
     def _looks_non_work(text: str) -> bool:
